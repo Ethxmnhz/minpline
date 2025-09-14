@@ -11,13 +11,15 @@ export function CloudSync() {
   const markSyncing = useStore(s => s.markSyncing);
   const markSynced = useStore(s => s.markSynced);
   const markSyncError = useStore(s => s.markSyncError);
-  const cloudStatus = useStore(s => s.cloudStatus); // kept if UI reads it elsewhere
+  const cloudStatus = useStore(s => s.cloudStatus);
   const setCloudError = useStore(s => s.setCloudError);
   // syncKey no longer used for global mode
 
   const unsubRef = useRef<() => void>();
-  const lastKnownRemoteRevisionRef = useRef<number>(-1);
-  const lastPushedRevisionRef = useRef<number>(-1);
+  const lastPushRef = useRef<number>(0);
+  const uidRef = useRef<string|null>('global');
+  const lastSnapshotRef = useRef<string>('');
+  const lastSnapshotRevisionRef = useRef<number>(-1);
 
   // Initial connect / subscribe - also react to syncKey changes
   useEffect(() => {
@@ -34,37 +36,40 @@ export function CloudSync() {
         if (cancelled) return;
         if (remote) {
           const rRev = typeof remote.revision === 'number' ? remote.revision : 0;
-          const localRev = getSafeLocalRevision();
-          if (rRev > localRev) {
+          // Only pull remote if it's strictly newer than our local revision
+          if (rRev > getSafeLocalRevision()) {
             importData(remote);
-            lastKnownRemoteRevisionRef.current = rRev;
-            lastPushedRevisionRef.current = rRev; // baseline
-          } else if (rRev < localRev) {
+            lastSnapshotRef.current = JSON.stringify(remote);
+            lastSnapshotRevisionRef.current = rRev;
+          } else if (rRev < getSafeLocalRevision()) {
+            // Our local is newer; push it up
             const payload = exportData();
             await saveGlobalData(payload);
-            lastKnownRemoteRevisionRef.current = payload.revision;
-            lastPushedRevisionRef.current = payload.revision;
+            lastSnapshotRef.current = JSON.stringify(payload);
+            lastSnapshotRevisionRef.current = payload.revision;
           } else {
-            lastKnownRemoteRevisionRef.current = rRev;
-            lastPushedRevisionRef.current = rRev;
+            // Equal revisions; treat remote as authoritative snapshot baseline
+            lastSnapshotRef.current = JSON.stringify(remote);
+            lastSnapshotRevisionRef.current = rRev;
           }
         } else {
           const payload = exportData();
           await saveGlobalData(payload);
-          lastKnownRemoteRevisionRef.current = payload.revision;
-          lastPushedRevisionRef.current = payload.revision;
+          lastSnapshotRef.current = JSON.stringify(payload);
+          lastSnapshotRevisionRef.current = payload.revision;
         }
         markSynced();
         unsubRef.current = subscribeGlobalData((data: any) => {
           if (!data) return;
+          const serialized = JSON.stringify(data);
+          if (serialized === lastSnapshotRef.current) return; // no change
           const rRev = typeof data.revision === 'number' ? data.revision : 0;
-          if (rRev <= lastKnownRemoteRevisionRef.current) return; // stale or duplicate
-            const localRev = getSafeLocalRevision();
-            if (rRev > localRev) {
-              importData(data);
-              lastKnownRemoteRevisionRef.current = rRev;
-              // don't modify lastPushedRevisionRef; it reflects last local push
-            }
+          // Only import if remote revision is newer than BOTH local and last imported snapshot revision
+          if (rRev > getSafeLocalRevision() && rRev > lastSnapshotRevisionRef.current) {
+            importData(data);
+            lastSnapshotRef.current = serialized;
+            lastSnapshotRevisionRef.current = rRev;
+          }
         });
       } catch (e) {
         console.error('Global sync init failed', e);
@@ -91,16 +96,22 @@ export function CloudSync() {
 
   useEffect(() => {
   if (!cloudEnabled) return;
-    // Shorter debounce for faster propagation
-    const delay = 800;
+    const now = Date.now();
+    // debounce ~1.5s
+    const delay = 1500;
     const timer = setTimeout(async () => {
       try {
         markSyncing();
         const payload = exportData();
-        if (payload.revision <= lastPushedRevisionRef.current) { markSynced(); return; }
+        const serialized = JSON.stringify(payload);
+        // Skip push if nothing changed OR our known remote has same or newer revision
+        if (serialized === lastSnapshotRef.current || payload.revision <= lastSnapshotRevisionRef.current) {
+          markSynced();
+          return;
+        }
         await saveGlobalData(payload);
-        lastPushedRevisionRef.current = payload.revision;
-        lastKnownRemoteRevisionRef.current = Math.max(lastKnownRemoteRevisionRef.current, payload.revision);
+        lastSnapshotRef.current = serialized;
+        lastSnapshotRevisionRef.current = payload.revision;
         markSynced();
       } catch (e) {
         console.error('Cloud push failed', e);
@@ -109,27 +120,6 @@ export function CloudSync() {
     }, delay);
     return () => clearTimeout(timer);
   }, [cloudEnabled, meals, workouts, mealTemplates, workoutSets, goals, localRevision]);
-
-  // Immediate (almost) push when revision changes specifically due to deletions to minimize window for resurrection.
-  // We'll approximate by pushing whenever localRevision increments and debounce wasn't yet scheduled: use another effect.
-  useEffect(() => {
-    if (!cloudEnabled) return;
-    if (localRevision <= lastPushedRevisionRef.current) return;
-    // Quick push with tiny delay (100ms) to batch rapid successive actions.
-    const t = setTimeout(async () => {
-      try {
-        const payload = exportData();
-        if (payload.revision <= lastPushedRevisionRef.current) return;
-        await saveGlobalData(payload);
-        lastPushedRevisionRef.current = payload.revision;
-        lastKnownRemoteRevisionRef.current = Math.max(lastKnownRemoteRevisionRef.current, payload.revision);
-      } catch (e) {
-        // Non-fatal; regular debounce cycle will retry
-        console.warn('Fast push failed', e);
-      }
-    }, 100);
-    return () => clearTimeout(t);
-  }, [localRevision, cloudEnabled]);
 
   return null;
 }
