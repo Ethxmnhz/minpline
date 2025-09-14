@@ -1,0 +1,9 @@
+{
+  "name": "Personal Tracker",
+  "short_name": "Tracker",
+  "display": "standalone",
+  "start_url": "/",
+  "background_color": "#0e1114",
+  "theme_color": "#0e1114",
+  "icons": []
+}
